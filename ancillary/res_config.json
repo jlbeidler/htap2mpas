@@ -1,0 +1,30 @@
+{
+    "sector": "g_residential",
+    "case": "2016fc",
+    "year": "2016",
+    "invlist": "edgar_HTAP_RESIDENTIAL_2010_21mar2016_v0_jan.lst",
+    "mpas": {
+        "mpasref": "/work/MOD3EVAL/bte/WO6-02_mpas/60x12/conus/global.360450.init.2016-06-21.nc",
+        "gridmap": "/home/jbeidler/repo/pyremap/examples/map_0.1x0.1degree_to_mpas6012_bilinear.nc",
+        "mesh": "MPAS60x12"
+    },
+    "htap": {
+        "htapsector": "RESIDENT",
+        "tz_mask": "/work/MOD3EVAL/bte/mpas_dev/gedat/GRIDMASK_EDGAR.ncf",
+        "layers": ""
+    },
+    "temporal": {
+        "mrgdates": "/work/MOD3EVAL/bte/mpas_dev/gedat/datemap_2016_to_2016.csv",
+        "rep_approach": "mwdss_N",
+        "tref": "/work/MOD3EVAL/bte/mpas_dev/gedat/HTAP_2011_BaseA_tref_21mar2016_v0",
+        "tpro_monthly": "/work/MOD3EVAL/bte/mpas_dev/gedat/HTAP_2011_BaseA_tpro_monthly_21mar2016_v0",
+        "tpro_hourly": "/work/MOD3EVAL/bte/mpas_dev/gedat/HTAP_2011_BaseA_tpro_hourly_21mar2016_v0",
+        "tpro_weekly": "/work/MOD3EVAL/bte/mpas_dev/gedat/HTAP_2011_BaseA_tpro_weekly_21mar2016_v0"
+    },
+    "speciation": {
+        "invtable": "/work/MOD3EVAL/bte/mpas_dev/gedat/invtable_2014platform_integrate_05oct2017_nf_v2.txt",
+        "gsref": "/work/MOD3EVAL/bte/mpas_dev/gedat/gsref_HTAP_27apr2016_nf_v1.txt",
+        "gspro": "/work/MOD3EVAL/bte/mpas_dev/gedat/gspro_HTAP_CB06_from_2011ei_28apr2017_v0.txt",
+        "mech": "cb6"
+    }
+}

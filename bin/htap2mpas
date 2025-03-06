@@ -1,0 +1,187 @@
+#!/usr/bin/env python
+# Take SMOKE output 0.1x0.1 HTAP file in g m-2 s-1 and mol m-2 s-1 by day and output to MPAS grid
+#  using weighting file
+# <beidler.james@epa.gov>
+
+import sys
+from datetime import datetime
+import numpy as np
+import pandas as pd
+import logging
+#import multiprocessing as mp
+import netCDF4 as ncf
+from scipy.sparse import csr_matrix
+import numpy.ma as ma
+import mpasncf as mpas
+from mpasncf.mpasutils import *
+from calendar import monthrange
+from htap2mpas.temporal import Temporal
+from htap2mpas.runconfig import RunConfig
+from htap2mpas.speciation import Speciation
+
+def main():
+    logname = 'test.log'
+    conf_json = 'res_config.json'
+    logger = logging.getLogger(__name__)
+    logging.basicConfig(filename=logname, encoding='utf-8', level=logging.DEBUG, format='%(levelname)s: %(message)s')
+    logging.info(f'START: {datetime.now()}')
+    conf = RunConfig(conf_json, logger) 
+    print(f'Logging to {logname}')
+    #thread_cnt = 1
+    ####################
+    # Do some global initialization
+    spec = Speciation(conf.htapsector, logger)
+    spec.load_gsref(conf.gsref)
+    spec.load_gspro(conf.gspro)
+    spec_table = spec.get_spec_table()
+    temp = Temporal(conf.htapsector, conf.rep_approach, logger)
+    temp.get_dates(conf.mrgdates)
+    temp.load_tref(conf.tref)
+    temp.load_weekly(conf.tpro_weekly)
+    temp.load_hourly(conf.tpro_hourly)
+    month_to_hour = temp.calc_month_to_hour()
+    mat = load_mat(conf.gridmap)
+    mpas_size, htap_size = mat.shape
+    # Load the timezone mask and make the temporal fractions tz aware
+    if conf.tz_mask:
+        tzones = load_htap(conf.tz_mask, 'TZONES')
+        if tzones.shape[0] != htap_size:
+            e = f'Grid dimension mismatch between allocation matrix and TZONE mask'
+            logger.error(e)
+            raise ValueError(e)
+        tzs = list(np.unique(tzones))
+        tzones_day = tzones.repeat(24)
+        month_to_hour = temp.make_tz_aware(month_to_hour, tzs)
+    invs = get_invlist(conf.invlist, conf.htapsector)
+    ###################
+    months = list(invs.month.drop_duplicates())
+    polls = {}
+    for month in months:
+        # Seconds in the month = 3600 s/hr * 24 hr/day * # of days/month
+        dimon = monthrange(int(conf.year), month)[1]
+        sec_in_month = 3600 * 24 * dimon 
+        # Load the pollutants from the monthly HTAP files
+        for n, row in invs[invs.month == month].iterrows():
+            logger.info(f'Loading {row.path}')
+            polls[row.poll] = load_htap(row.path, row.varname)
+            if n == 0 and polls[row.poll].shape[0] != htap_size:
+                e = f'Grid dimension mismatch between allocation matrix and HTAP input'
+                logger.error(e)
+                raise ValueError(e)
+        # Calc PMC and drop PM10
+        if 'PM10' in polls.keys():
+            polls['PMC'] = polls['PM10'] - polls['PM2_5'] 
+            polls.pop('PM10')
+            # PM2_5_OTH is used in place of total PM2_5
+            polls.pop('PM2_5')
+        for dt in list(temp.dates.loc[temp.dates.month == month, 'repdt'].drop_duplicates()):
+            dt_str = dt.strftime('%Y%m%d')
+            if conf.tz_mask:
+                # Build a temporal array where allocation fractions are shifted by the UTM offset
+                # Use the timezone mask to identify the offset locations on the array
+                tfrac = np.zeros(tzones_day.shape)
+                for tz in tzs:
+                    cells = len(tzones[tzones == tz])
+                    idx = (month_to_hour.date == dt) & (month_to_hour.offset == tz)
+                    tz_tfrac = np.array(month_to_hour.loc[idx, 'frac']).repeat(cells).transpose().ravel()
+                    np.putmask(tfrac, tzones_day == tz, tz_tfrac)
+            else:
+                tfrac = np.array(month_to_hour.loc[month_to_hour.date == dt, 'frac']).repeat(htap_size).transpose()
+            tfrac = tfrac.reshape([htap_size,24])
+            mpas_outfile = f'emis_{conf.sector}_{dt_str}_{conf.mesh}_{conf.case}_{conf.mech}.nc'
+            logger.info(f'Writing {dt_str} to {mpas_outfile}')
+            print(mpas_outfile)
+            with mpas.MPASDataset(conf.mpasref) as mpas_ref, mpas.MPASDataset(mpas_outfile, 'w') as mpas_out:
+                mpas_ncells = mpas_ref.dimensions['nCells'].size
+                # Copy all of the MPAS reference file dimensions except the number of timesteps, which we want from the
+                #  HTAP input file
+                copy_dims(mpas_ref, mpas_out, {'Time': 25})
+                # Calculate the values for the xtime variable from the HTAP input SDATE. Assume a 1 hour (3600 s) timestep
+                mpas_out.write_xtime(pd.to_datetime(dt), 3600)
+                # Copy the MPAS required variables and attributes from the MPAS ref file to the output
+                copy_mpas_reqvars(mpas_ref, mpas_out)
+                copy_mpas_reqatts(mpas_ref, mpas_out)
+                if conf.layers != '':
+                    mpas_out.layers = get_layer_atts(conf.layers) 
+                for poll_name, arr in polls.items():
+                    arr = (mat.dot(arr.repeat(24).reshape([htap_size,24]) * tfrac) * sec_in_month).transpose()
+                    # Add in hour 25 as the 1st hour of the next day, repeating hour 0 of the currrent day
+                    arr = np.concatenate((arr, arr[[0,],:]))
+                    poll_spec = spec_table[spec_table.poll == poll_name].copy()
+                    if len(poll_spec) == 0:
+                        e = f'No speciation cross-reference for inventory pollutant {poll_name}'
+                        logger.error(e)
+                        raise ValueError(e)
+                    for n, row  in poll_spec.iterrows():
+                        if row.mw == 1:
+                            units = 'g/s/m2'
+                        else:
+                            units = 'moles/s/m2'
+                        mpas_var = mpas_out.create_variable(row.spec, 'REAL', ['Time','nCells'], units=units, chunk_size=(1,mpas_ncells))
+                        # mol/s/m2  = arr (kg/hr/m2) / 3600 (s/hr) * 1000 (g/kg) / MW (g/mol) * split fraction 
+                        mpas_var[:] = ma.masked_equal(arr / 3600 * 1000 / row.mw * row.frac, 0)
+                        logger.info('%s %s/day: %s' %(row.spec, units.split('/')[0], (np.sum(mpas_var[:24,:]) * 3600)))
+                        mpas_out.sync()
+
+def get_invlist(fn, htapsector):
+    '''
+    Read in the inventory list formatted for HTAP-SMOKE
+    '''
+    dtype = {'sector': str, 'poll': str, 'varname': str, 'month': int, 'path': str}
+    df = pd.read_csv(fn, dtype=dtype)
+    return df[df.sector == htapsector].copy()
+
+def load_mat(fn):
+    '''
+    Load the remap file and create the remapping matrix
+    CSR matrix and remap format based on pyremap: https://github.com/MPAS-Dev/pyremap
+    pyremap distributed under the BSD-3 license and is copyright 2019 Triad National Security 2019 
+    LANL US DOE/NNSA
+    '''
+    with ncf.Dataset(fn) as ds:
+        S = ds.variables['S'][:]
+        row = ds.variables['row'][:] - 1
+        col = ds.variables['col'][:] - 1
+        nb = ds.dimensions['n_b'].size
+        na = ds.dimensions['n_a'].size
+        # (mpas cell, input cell), fraction
+        mat = csr_matrix((S, (row,col)), shape=(nb,na))
+    return mat
+
+def get_layer_atts(layers):
+    '''
+    Parameters
+
+    layers:
+        Path to layer fractions file
+    '''
+    layer_att = ['layer,bottom,top,fraction',]
+    with open(layers) as f:
+        for l in f:
+            if not l.startswith('#'):
+                layer_att.append(l.strip())
+    return ';'.join(layer_att)
+
+def load_htap(fn, var_name):
+    '''
+    Load an HTAP variable 
+    HTAP longitude origin is 0 rather than -180
+    
+    Parameters
+
+    fn:
+        Path to HTAP netCDF
+
+    var_name:
+        Variable name in netCDF to retrieve
+    '''
+    with ncf.Dataset(fn) as htap:
+        htap_arr = htap.variables[var_name][:]
+    # Need a better way to differentiate 4 (I/O API) vs 2 (HTAP) dimensional datasets
+    if len(htap_arr.shape) == 4:
+        htap_arr = htap_arr[0,0,:]
+    # HTAP origin at 0 deg lon, flip over to -180
+    return np.concatenate((htap_arr[:,1800:], htap_arr[:,:1800]), axis=1).ravel()
+
+if __name__ == '__main__':
+    main()
